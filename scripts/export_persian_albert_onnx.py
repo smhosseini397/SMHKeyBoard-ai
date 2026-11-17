@@ -1,281 +1,229 @@
 
 #!/usr/bin/env python3
-"""Download and export Persian ALBERT to ONNX for Android."""
+# -*- coding: utf-8 -*-
 
+"""
+Export Persian ALBERT MLM to ONNX.
+Tokenizer is loaded from tokenizer.json.
+SentencePiece file is NOT required.
+"""
+
+import os
+import sys
 from pathlib import Path
-import json
-import shutil
-import tempfile
 
 import torch
 import onnx
-import sentencepiece as spm
 
-from transformers import AutoModelForMaskedLM, AutoTokenizer
-
-
-REPO = "shekar-ai/albert-base-v2-persian-zwnj-naab-mlm"
-
-OUT = Path("app/src/main/assets/semantic")
-OUT.mkdir(parents=True, exist_ok=True)
-
-print("=" * 60)
-print("Persian ALBERT ONNX Export")
-print(f"Model: {REPO}")
-print("=" * 60)
+from transformers import AutoTokenizer, AutoModelForMaskedLM
 
 
-# --------------------------------------------------
-# 1. Load tokenizer
-# --------------------------------------------------
+MODEL_NAME = "shekar-ai/albert-base-v2-persian-zwnj-naab-mlm"
 
-print("\n[1/6] Loading tokenizer...")
+ROOT_DIR = Path(__file__).resolve().parents[1]
 
-tokenizer = AutoTokenizer.from_pretrained(
-    REPO,
-    use_fast=False,
+OUTPUT_DIR = (
+    ROOT_DIR
+    / "app"
+    / "src"
+    / "main"
+    / "assets"
+    / "semantic"
 )
 
-print("Tokenizer:", tokenizer.__class__.__name__)
+ONNX_FILE = OUTPUT_DIR / "albert_persian_mlm.onnx"
+
+MAX_LENGTH = 32
+OPSET_VERSION = 17
 
 
-# --------------------------------------------------
-# 2. Extract SentencePiece model safely
-# --------------------------------------------------
+class AlbertONNXWrapper(torch.nn.Module):
 
-print("\n[2/6] Extracting SentencePiece model...")
-
-with tempfile.TemporaryDirectory() as temp_dir:
-
-    temp_path = Path(temp_dir)
-
-    tokenizer.save_pretrained(temp_path)
-
-    vocab_file = getattr(tokenizer, "vocab_file", None)
-
-    candidates = []
-
-    if vocab_file:
-        candidates.append(Path(vocab_file))
-
-    candidates.extend([
-        temp_path / "spiece.model",
-        temp_path / "sentencepiece.bpe.model",
-        temp_path / "tokenizer.model",
-    ])
-
-    source_spiece = next(
-        (p for p in candidates if p.is_file()),
-        None,
-    )
-
-    if source_spiece is None:
-        raise FileNotFoundError(
-            "SentencePiece model could not be located. "
-            "Tokenizer files: "
-            + ", ".join(p.name for p in temp_path.iterdir())
-        )
-
-    destination_spiece = OUT / "spiece.model"
-
-    shutil.copy2(
-        source_spiece,
-        destination_spiece,
-    )
-
-# Validate actual SentencePiece model.
-
-processor = spm.SentencePieceProcessor(
-    model_file=str(OUT / "spiece.model")
-)
-
-if processor.get_piece_size() <= 0:
-    raise RuntimeError("Invalid SentencePiece vocabulary.")
-
-print("SentencePiece vocabulary size:", processor.get_piece_size())
-
-
-# --------------------------------------------------
-# 3. Save exact special token IDs
-# --------------------------------------------------
-
-print("\n[3/6] Saving special tokens...")
-
-required_tokens = [
-    "cls_token_id",
-    "sep_token_id",
-    "mask_token_id",
-    "unk_token_id",
-    "pad_token_id",
-]
-
-special = {}
-
-for name in required_tokens:
-    value = getattr(tokenizer, name, None)
-
-    if value is None:
-        raise RuntimeError(
-            f"Missing required tokenizer token: {name}"
-        )
-
-    special[name] = int(value)
-
-(OUT / "special_tokens.json").write_text(
-    json.dumps(special, ensure_ascii=False, indent=2),
-    encoding="utf-8",
-)
-
-print(json.dumps(special, indent=2))
-
-
-# --------------------------------------------------
-# 4. Load pretrained ALBERT
-# --------------------------------------------------
-
-print("\n[4/6] Loading pretrained ALBERT model...")
-
-model = AutoModelForMaskedLM.from_pretrained(
-    REPO,
-    use_safetensors=True,
-).cpu().eval()
-
-torch.set_num_threads(1)
-
-
-class ExportWrapper(torch.nn.Module):
-
-    def __init__(self, wrapped):
+    def __init__(self, model):
         super().__init__()
-        self.wrapped = wrapped
+        self.model = model
 
-    def forward(
-        self,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-    ):
-
-        output = self.wrapped(
+    def forward(self, input_ids, attention_mask, token_type_ids):
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             return_dict=False,
         )
-
-        return output[0]
-
-
-wrapper = ExportWrapper(model).eval()
+        return outputs[0]
 
 
-# --------------------------------------------------
-# 5. Export ONNX
-# --------------------------------------------------
+def main():
 
-print("\n[5/6] Exporting ONNX model...")
+    print("=" * 60)
+    print("Persian ALBERT ONNX Export")
+    print("Model:", MODEL_NAME)
+    print("=" * 60)
 
-ids = torch.tensor(
-    [[
-        special["cls_token_id"],
-        special["mask_token_id"],
-        special["sep_token_id"],
-    ]],
-    dtype=torch.long,
-)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-mask = torch.ones_like(ids)
-types = torch.zeros_like(ids)
+    # --------------------------------------------------
+    # 1. Load tokenizer
+    # --------------------------------------------------
 
-onnx_path = OUT / "albert_persian_mlm.onnx"
+    print("[1/6] Loading tokenizer...")
 
-# Remove any stale output before exporting.
-if onnx_path.exists():
-    onnx_path.unlink()
-
-with torch.inference_mode():
-
-    torch.onnx.export(
-        wrapper,
-        (ids, mask, types),
-        str(onnx_path),
-
-        input_names=[
-            "input_ids",
-            "attention_mask",
-            "token_type_ids",
-        ],
-
-        output_names=["logits"],
-
-        dynamic_axes={
-            "input_ids": {
-                0: "batch",
-                1: "sequence",
-            },
-            "attention_mask": {
-                0: "batch",
-                1: "sequence",
-            },
-            "token_type_ids": {
-                0: "batch",
-                1: "sequence",
-            },
-            "logits": {
-                0: "batch",
-                1: "sequence",
-            },
-        },
-
-        opset_version=17,
-        do_constant_folding=True,
-        dynamo=False,
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        use_fast=True,
     )
 
+    if not tokenizer.is_fast:
+        raise RuntimeError(
+            "Fast tokenizer is required for this export."
+        )
 
-# --------------------------------------------------
-# 6. Validate exported ONNX
-# --------------------------------------------------
+    print("Tokenizer:", type(tokenizer).__name__)
 
-print("\n[6/6] Validating exported model...")
+    # --------------------------------------------------
+    # 2. Save tokenizer files
+    # --------------------------------------------------
 
-if not onnx_path.is_file() or onnx_path.stat().st_size == 0:
-    raise RuntimeError("ONNX export failed: empty model file.")
+    print("[2/6] Saving tokenizer...")
 
-onnx_model = onnx.load(str(onnx_path))
+    tokenizer.save_pretrained(OUTPUT_DIR)
 
-onnx.checker.check_model(onnx_model)
+    tokenizer_json = OUTPUT_DIR / "tokenizer.json"
 
-expected_inputs = {
-    "input_ids",
-    "attention_mask",
-    "token_type_ids",
-}
+    if not tokenizer_json.exists():
+        raise FileNotFoundError(
+            "tokenizer.json was not generated."
+        )
 
-actual_inputs = {
-    item.name for item in onnx_model.graph.input
-}
+    print("Tokenizer saved:", tokenizer_json)
 
-if not expected_inputs.issubset(actual_inputs):
-    raise RuntimeError(
-        f"Missing ONNX inputs: {expected_inputs - actual_inputs}"
+    # --------------------------------------------------
+    # 3. Load actual pretrained model
+    # --------------------------------------------------
+
+    print("[3/6] Loading pretrained ALBERT model...")
+
+    model = AutoModelForMaskedLM.from_pretrained(
+        MODEL_NAME,
     )
 
-print("\n" + "=" * 60)
-print("PERSIAN ALBERT EXPORT SUCCESSFUL")
-print("=" * 60)
+    model.eval()
+    model.cpu()
 
-for filename in [
-    "albert_persian_mlm.onnx",
-    "spiece.model",
-    "special_tokens.json",
-]:
+    wrapper = AlbertONNXWrapper(model)
+    wrapper.eval()
 
-    path = OUT / filename
+    print("Model loaded successfully.")
 
-    if not path.is_file() or path.stat().st_size == 0:
-        raise RuntimeError(f"Missing or empty asset: {path}")
+    # --------------------------------------------------
+    # 4. Prepare sample inputs
+    # --------------------------------------------------
 
-    print(f"{path}: {path.stat().st_size:,} bytes")
+    print("[4/6] Preparing ONNX inputs...")
 
-print("\nAll model assets successfully generated.")
+    sample = tokenizer(
+        "این یک آزمایش برای مدل زبان فارسی است.",
+        return_tensors="pt",
+        max_length=MAX_LENGTH,
+        padding="max_length",
+        truncation=True,
+    )
+
+    input_ids = sample["input_ids"]
+    attention_mask = sample["attention_mask"]
+
+    token_type_ids = sample.get(
+        "token_type_ids",
+        torch.zeros_like(input_ids),
+    )
+
+    # --------------------------------------------------
+    # 5. Export ONNX
+    # --------------------------------------------------
+
+    print("[5/6] Exporting ONNX model...")
+
+    with torch.no_grad():
+
+        torch.onnx.export(
+            wrapper,
+            (
+                input_ids,
+                attention_mask,
+                token_type_ids,
+            ),
+            str(ONNX_FILE),
+
+            input_names=[
+                "input_ids",
+                "attention_mask",
+                "token_type_ids",
+            ],
+
+            output_names=[
+                "logits",
+            ],
+
+            dynamic_axes={
+                "input_ids": {
+                    0: "batch_size",
+                    1: "sequence_length",
+                },
+                "attention_mask": {
+                    0: "batch_size",
+                    1: "sequence_length",
+                },
+                "token_type_ids": {
+                    0: "batch_size",
+                    1: "sequence_length",
+                },
+                "logits": {
+                    0: "batch_size",
+                    1: "sequence_length",
+                },
+            },
+
+            opset_version=OPSET_VERSION,
+            do_constant_folding=True,
+            export_params=True,
+            dynamo=False,
+        )
+
+    # --------------------------------------------------
+    # 6. Validate ONNX
+    # --------------------------------------------------
+
+    print("[6/6] Validating ONNX model...")
+
+    onnx_model = onnx.load(str(ONNX_FILE))
+
+    onnx.checker.check_model(onnx_model)
+
+    if not ONNX_FILE.exists() or ONNX_FILE.stat().st_size == 0:
+        raise RuntimeError("ONNX output is empty.")
+
+    print("=" * 60)
+    print("EXPORT COMPLETED SUCCESSFULLY")
+    print("=" * 60)
+
+    print("ONNX:", ONNX_FILE)
+    print(
+        "ONNX size:",
+        round(ONNX_FILE.stat().st_size / (1024 * 1024), 2),
+        "MB",
+    )
+
+    print("Tokenizer:", tokenizer_json)
+    print("Vocabulary size:", len(tokenizer))
+    print("Maximum sequence length:", MAX_LENGTH)
+
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print("\nEXPORT FAILED:")
+        print(str(error))
+        sys.exit(1)
