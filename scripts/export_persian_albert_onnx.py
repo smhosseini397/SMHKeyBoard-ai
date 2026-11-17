@@ -23,9 +23,19 @@ special = {
 }
 (OUT / "special_tokens.json").write_text(json.dumps(special, ensure_ascii=False, indent=2), encoding="utf-8")
 
-spiece = Path(tokenizer.vocab_file)
-shutil.copyfile(spiece, OUT / "spiece.model")
+spiece_path = getattr(tokenizer, "vocab_file", None)
 
+if not spiece_path:
+    raise RuntimeError(
+        "SentencePiece vocab_file was not found in the loaded tokenizer."
+    )
+
+spiece = Path(spiece_path)
+
+if not spiece.is_file():
+    raise FileNotFoundError(f"Tokenizer model not found: {spiece}")
+
+shutil.copy2(spiece, OUT / "spiece.model")
 class ExportWrapper(torch.nn.Module):
     def __init__(self, wrapped):
         super().__init__()
